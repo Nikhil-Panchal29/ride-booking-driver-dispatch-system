@@ -1,5 +1,4 @@
 import express from 'express';
-import mongoose from 'mongoose';
 import Ride from '../models/Ride.js';
 import QueueJob from '../models/QueueJob.js';
 import { getNextCounterValue, publishEvent } from '../services/publishEvent.js';
@@ -18,42 +17,32 @@ router.post('/rides', async (req, res) => {
     return res.status(400).json({ error: 'riderName, pickup and drop are required' });
   }
 
-  const session = await mongoose.startSession();
-
   try {
-    // Ride IDs are allocated outside the transaction. Event sequence numbers
-    // are allocated inside publishEvent() so event order matches commit order.
     const rideSeq = await getNextCounterValue('rideId');
     const rideId = formatRideId(rideSeq);
 
-    let result;
-
-    // Transaction ensures the ride, queue job and REQUESTED event are
-    // saved together. If any write fails, all of them are rolled back.
-    await session.withTransaction(async () => {
-      const ride = new Ride({
-        rideId,
-        riderName,
-        pickup,
-        drop,
-        status: 'REQUESTED',
-      });
-      await ride.save({ session });
-
-      const job = new QueueJob({ rideId, status: 'PENDING' });
-      await job.save({ session });
-
-      await publishEvent({ rideId, status: 'REQUESTED' }, { session });
-
-      result = { rideId, status: ride.status };
+    const ride = await Ride.create({
+      rideId,
+      riderName,
+      pickup,
+      drop,
+      status: 'REQUESTED',
     });
 
-    return res.status(201).json(result);
+    try {
+      await QueueJob.create({ rideId, status: 'PENDING' });
+      await publishEvent({ rideId, status: 'REQUESTED' });
+    } catch (bookingError) {
+      // Best-effort cleanup: do not leave a ride without its queue job/event.
+      await QueueJob.deleteOne({ rideId }).catch(() => {});
+      await Ride.deleteOne({ rideId }).catch(() => {});
+      throw bookingError;
+    }
+
+    return res.status(201).json({ rideId, status: ride.status });
   } catch (error) {
     console.error('Failed to book ride:', error.message);
     return res.status(500).json({ error: 'Failed to book ride' });
-  } finally {
-    await session.endSession();
   }
 });
 

@@ -1,6 +1,6 @@
 # Ride Dispatch System
 
-A simple backend-only ride booking and driver dispatch system built with Node.js, Express, MongoDB Atlas, Mongoose and plain JavaScript ES modules.
+A simple backend-only ride booking and driver dispatch system built with Node.js, Express, MongoDB, Mongoose and plain JavaScript ES modules.
 
 This project is intentionally beginner-friendly: it uses small functions, clear names, simple polling workers/consumers, and MongoDB atomic operations for the important race-condition checks.
 
@@ -8,7 +8,7 @@ This project is intentionally beginner-friendly: it uses small functions, clear 
 
 - Node.js
 - Express.js
-- MongoDB Atlas
+- MongoDB
 - Mongoose
 - JavaScript ES modules (`import` / `export`)
 - npm packages: `express`, `mongoose`, `dotenv`
@@ -66,13 +66,13 @@ flowchart LR
 
 1. A client calls `POST /rides` with `riderName`, `pickup` and `drop`.
 2. The API generates a unique `rideId` from the `Counter` collection.
-3. Inside a MongoDB transaction, the API creates:
+3. The API creates:
    - a `Ride` document with status `REQUESTED`
    - a `QueueJob` document with status `PENDING`
    - a `RideEvent` document for status `REQUESTED`
 4. The API immediately returns the `rideId`.
 
-Using a transaction means the ride, queue job and first event are saved together. If one write fails, all of them are rolled back.
+The writes are sequential for standalone MongoDB compatibility. If queue/event creation fails, the API attempts to remove the partially created ride/job.
 
 ### 2. Background worker logic
 
@@ -93,11 +93,11 @@ It repeatedly:
 6. On accept:
    - It updates the ride only if it is still `REQUESTED` and has `driverId: null`.
    - This conditional update prevents one ride from being assigned to two drivers.
-   - It publishes an `ASSIGNED` event and marks the queue job `DONE` in the same transaction.
+   - It publishes an `ASSIGNED` event and marks the queue job `DONE`.
 7. On reject:
    - It increments `rejections` on the queue job and tries the next driver in the shuffled order.
 8. After exactly 3 rejections:
-   - It marks the ride `NO_DRIVER_FOUND`, publishes that event, and marks the job `DONE` in a transaction.
+   - It marks the ride `NO_DRIVER_FOUND`, publishes that event, and marks the job `DONE`.
 
 ### 3. Event publishing and consumers
 
@@ -147,21 +147,19 @@ Response:
 
 ## MongoDB setup
 
-1. Create a free MongoDB Atlas cluster.
-2. Create a database user.
-3. Under **Network Access**, allow your current IP address.
-4. Copy the connection string.
-5. Create `.env` from `.env.example` and fill in `MONGO_URI`.
+For local standalone MongoDB, make sure `mongod` is running and create/use the `ride-dispatch-system` database. For MongoDB Atlas, use your Atlas connection string instead.
 
-Example:
+Create `.env` from `.env.example` and set `MONGO_URI`.
+
+Example for local standalone MongoDB:
 
 ```env
 PORT=5000
-MONGO_URI=mongodb+srv://<username>:<password>@<cluster-url>/ride-dispatch?retryWrites=true&w=majority
+MONGO_URI=mongodb://127.0.0.1:27017/ride-dispatch-system
 API_URL=http://localhost:5000
 ```
 
-MongoDB transactions require a replica set. MongoDB Atlas supports transactions by default.
+This project uses atomic updates and does not require MongoDB transactions, so it works with standalone MongoDB.
 
 ## Installation
 
@@ -176,7 +174,7 @@ On macOS/Linux, use:
 cp .env.example .env
 ```
 
-Then edit `.env` and add your MongoDB Atlas connection string.
+Then edit `.env` and set `MONGO_URI` to your MongoDB connection string.
 
 ## Running the project
 
@@ -258,7 +256,7 @@ Both consumers reached event `seq=202`, matching the maximum stored event sequen
 - Drivers are fake and responses are random; there is no real driver app, maps, ETA or rating system.
 - The worker is designed for a single worker process. The atomic job claim prevents duplicate processing, but the startup recovery step that resets `PROCESSING` jobs assumes only one worker is running.
 - Consumers use simple polling and provide at-least-once delivery. If a consumer crashes after printing an event but before saving its offset, that event may be processed again after restart.
-- Event ordering is protected by storing event sequence numbers inside the same MongoDB transaction as the ride status change. This requires MongoDB transactions, which are supported by MongoDB Atlas.
+- Without transactions, a crash between a ride status update and its event insert could leave a status change without an event. Unique event sequence numbers prevent duplicate event sequence values, but they cannot make multi-document writes atomic on standalone MongoDB.
 - There is no authentication, authorization, payment gateway or production monitoring.
 
 ## Interview notes
@@ -270,5 +268,5 @@ Good things to explain:
 - The conditional update `{ status: 'REQUESTED', driverId: null }` prevents double assignment.
 - `rideevents` is an event collection/outbox.
 - `consumeroffsets` gives each consumer an independent position in the event stream.
-- Transactions are used for booking and final ride-status changes so related writes succeed or fail together.
+- Atomic `findOneAndUpdate` calls protect job claiming, driver assignment and final status changes without requiring transactions.
 - The load test calculates results from MongoDB instead of hardcoding expected output.

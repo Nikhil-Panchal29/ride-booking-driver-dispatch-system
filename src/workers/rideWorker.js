@@ -1,4 +1,3 @@
-import mongoose from 'mongoose';
 import connectDB from '../config/db.js';
 import Ride from '../models/Ride.js';
 import QueueJob from '../models/QueueJob.js';
@@ -36,92 +35,55 @@ async function claimNextJob() {
   );
 }
 
-// Tries to assign a driver inside a transaction.
-// The Ride update is conditional: it only succeeds if the ride is still
-// REQUESTED and has no driver. This is the key protection against assigning
-// one ride to two drivers.
+// Tries to assign a driver using an atomic conditional update.
+// The Ride update only succeeds if the ride is still REQUESTED and has no
+// driver, which prevents one ride from being assigned to two drivers.
 async function assignDriver(job, driver) {
-  const session = await mongoose.startSession();
-  let assignedRide = null;
+  const assignedRide = await Ride.findOneAndUpdate(
+    { rideId: job.rideId, status: 'REQUESTED', driverId: null },
+    {
+      $set: {
+        status: 'ASSIGNED',
+        driverId: driver.id,
+        rejectionCount: job.rejections,
+        assignedAt: new Date(),
+      },
+    },
+    { new: true }
+  );
 
-  try {
-    await session.withTransaction(async () => {
-      assignedRide = await Ride.findOneAndUpdate(
-        { rideId: job.rideId, status: 'REQUESTED', driverId: null },
-        {
-          $set: {
-            status: 'ASSIGNED',
-            driverId: driver.id,
-            rejectionCount: job.rejections,
-            assignedAt: new Date(),
-          },
-        },
-        { new: true, session }
-      );
-
-      if (assignedRide) {
-        // publishEvent allocates the event seq inside this transaction, so
-        // event sequence order matches transaction commit order.
-        await publishEvent(
-          { rideId: job.rideId, status: 'ASSIGNED' },
-          { session }
-        );
-        await QueueJob.updateOne(
-          { _id: job._id },
-          { $set: { status: 'DONE', driverId: driver.id } },
-          { session }
-        );
-      }
-    });
-  } finally {
-    await session.endSession();
+  if (!assignedRide) {
+    return false;
   }
 
-  if (assignedRide) {
-    console.log(`Ride ${job.rideId} assigned to ${driver.id}`);
-    return true;
-  }
+  await publishEvent({ rideId: job.rideId, status: 'ASSIGNED' });
+  await QueueJob.updateOne(
+    { _id: job._id },
+    { $set: { status: 'DONE', driverId: driver.id } }
+  );
 
-  return false;
+  console.log(`Ride ${job.rideId} assigned to ${driver.id}`);
+  return true;
 }
 
-// Marks a ride as NO_DRIVER_FOUND after 3 rejections, also inside a
-// transaction so the ride update, event and queue completion stay together.
+// Marks a ride as NO_DRIVER_FOUND after 3 rejections using the same kind of
+// atomic conditional update, so it cannot overwrite an ASSIGNED ride.
 async function markNoDriverFound(job) {
-  const session = await mongoose.startSession();
-  let updatedRide = null;
-
-  try {
-    await session.withTransaction(async () => {
-      updatedRide = await Ride.findOneAndUpdate(
-        { rideId: job.rideId, status: 'REQUESTED', driverId: null },
-        {
-          $set: {
-            status: 'NO_DRIVER_FOUND',
-            rejectionCount: MAX_REJECTIONS,
-            noDriverAt: new Date(),
-          },
-        },
-        { new: true, session }
-      );
-
-      if (updatedRide) {
-        await publishEvent(
-          { rideId: job.rideId, status: 'NO_DRIVER_FOUND' },
-          { session }
-        );
-        await QueueJob.updateOne(
-          { _id: job._id },
-          { $set: { status: 'DONE' } },
-          { session }
-        );
-      }
-    });
-  } finally {
-    await session.endSession();
-  }
+  const updatedRide = await Ride.findOneAndUpdate(
+    { rideId: job.rideId, status: 'REQUESTED', driverId: null },
+    {
+      $set: {
+        status: 'NO_DRIVER_FOUND',
+        rejectionCount: MAX_REJECTIONS,
+        noDriverAt: new Date(),
+      },
+    },
+    { new: true }
+  );
 
   if (updatedRide) {
+    await publishEvent({ rideId: job.rideId, status: 'NO_DRIVER_FOUND' });
+    await QueueJob.updateOne({ _id: job._id }, { $set: { status: 'DONE' } });
     console.log(`Ride ${job.rideId} has NO_DRIVER_FOUND`);
     return true;
   }
